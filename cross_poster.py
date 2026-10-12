@@ -2,6 +2,8 @@ import json
 import os
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -11,10 +13,15 @@ VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "").strip()
 MAX_CHAT_ID = int(os.environ.get("MAX_CHAT_ID", "0").strip())
 
-VK_DOMAIN = "lider_kurkino"
+VK_GROUP_ID = 223990998  # ID группы «МБУ молодежный центр "Лидер"»
 VK_API_VERSION = "5.131"
 MAX_API_BASE = "https://platform-api2.max.ru"
 STATE_FILE = "state.json"
+
+# Создаём сессию с автоматическим повтором запросов при задержках сети
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
 
 
 def load_state():
@@ -37,35 +44,6 @@ def save_state(ts, sent_posts):
         }, f, ensure_ascii=False, indent=2)
 
 
-def init_vk_group():
-    """Получает ID группы ВК и проверяет настройки Long Poll."""
-    url = "https://api.vk.com/method/groups.getById"
-    params = {
-        "group_id": VK_DOMAIN,
-        "access_token": VK_TOKEN,
-        "v": VK_API_VERSION
-    }
-    res = requests.get(url, params=params, timeout=15, verify=False).json()
-    if "error" in res:
-        raise RuntimeError(f"Ошибка VK API: {res['error'].get('error_msg')}")
-
-    groups = res["response"] if isinstance(res["response"], list) else res["response"].get("groups", [])
-    group_id = groups[0]["id"]
-    group_name = groups[0].get("name", VK_DOMAIN)
-    print(f"Подключено к группе ВК: «{group_name}» (ID: {group_id})")
-
-    requests.get("https://api.vk.com/method/groups.setLongPollSettings", params={
-        "group_id": group_id,
-        "enabled": 1,
-        "api_version": VK_API_VERSION,
-        "wall_post_new": 1,
-        "access_token": VK_TOKEN,
-        "v": VK_API_VERSION
-    }, timeout=15, verify=False)
-
-    return group_id
-
-
 def get_vk_longpoll_server(group_id):
     """Получает актуальные server, key и ts от ВКонтакте."""
     url = "https://api.vk.com/method/groups.getLongPollServer"
@@ -74,7 +52,7 @@ def get_vk_longpoll_server(group_id):
         "access_token": VK_TOKEN,
         "v": VK_API_VERSION
     }
-    res = requests.get(url, params=params, timeout=15, verify=False).json()
+    res = session.get(url, params=params, timeout=30, verify=False).json()
     if "error" in res:
         raise RuntimeError(f"Ошибка Long Poll ВК: {res['error'].get('error_msg')}")
     return res["response"]
@@ -97,20 +75,20 @@ def upload_image_to_max(photo_url):
     """Загружает фото на сервер MAX через /uploads."""
     headers = {"Authorization": MAX_TOKEN}
     try:
-        img_resp = requests.get(photo_url, timeout=20, verify=False)
+        img_resp = session.get(photo_url, timeout=30, verify=False)
         if img_resp.status_code == 200:
-            init_resp = requests.post(
+            init_resp = session.post(
                 f"{MAX_API_BASE}/uploads",
                 params={"type": "image"},
                 headers=headers,
-                timeout=15,
+                timeout=20,
                 verify=False
             )
             if init_resp.status_code == 200:
                 upload_url = init_resp.json().get("url")
                 if upload_url:
                     files = {"data": ("photo.jpg", img_resp.content, "image/jpeg")}
-                    up_resp = requests.post(upload_url, files=files, timeout=30, verify=False)
+                    up_resp = session.post(upload_url, files=files, timeout=35, verify=False)
                     if up_resp.status_code == 200:
                         up_json = up_resp.json()
                         if "token" in up_json:
@@ -207,7 +185,7 @@ def send_to_max(chat_id, text, max_attachments):
     if max_attachments:
         time.sleep(1.5)
 
-    response = requests.post(url, params=params, json=payload, headers=headers, timeout=25, verify=False)
+    response = session.post(url, params=params, json=payload, headers=headers, timeout=30, verify=False)
     if response.status_code == 200:
         print("-> Пост успешно опубликован в канале MAX!")
         return True
@@ -217,8 +195,12 @@ def send_to_max(chat_id, text, max_attachments):
 
 
 def main():
-    group_id = init_vk_group()
-    lp_data = get_vk_longpoll_server(group_id)
+    try:
+        lp_data = get_vk_longpoll_server(VK_GROUP_ID)
+    except Exception as e:
+        print(f"Временная задержка сети ВК ({e}). Пропускаем цикл до следующего запуска.")
+        return
+
     server = lp_data["server"]
     key = lp_data["key"]
     current_ts = str(lp_data["ts"])
@@ -227,18 +209,21 @@ def main():
     saved_ts = state.get("ts")
     sent_posts = state.get("sent_posts", [])
 
-    # Если это самый первый запуск на GitHub — сохраняем текущую точку отсчёта
     if not saved_ts:
         print(f"Первый запуск: зафиксирован начальный номер событий ВК (ts={current_ts}).")
         save_state(current_ts, sent_posts)
         return
 
     print(f"Проверка новых постов ВК начиная с события ts={saved_ts}...")
-    lp_res = requests.get(
-        f"{server}?act=a_check&key={key}&ts={saved_ts}&wait=1",
-        timeout=20,
-        verify=False
-    ).json()
+    try:
+        lp_res = session.get(
+            f"{server}?act=a_check&key={key}&ts={saved_ts}&wait=1",
+            timeout=30,
+            verify=False
+        ).json()
+    except Exception as e:
+        print(f"Временная задержка чтения событий ВК ({e}). Попробуем в следующем цикле.")
+        return
 
     if "failed" in lp_res:
         print(f"Сервер событий ВК обновил историю (код {lp_res.get('failed')}), синхронизируем ts={current_ts}.")
